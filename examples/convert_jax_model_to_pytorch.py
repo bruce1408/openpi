@@ -532,13 +532,21 @@ def convert_pi0_checkpoint(
     # Save model weights as SafeTensors using save_model to handle tied weights
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
-    if assets_source.exists():
+    # Copy assets (norm stats). Prefer checkpoint_dir/assets, then the parent folder.
+    ckpt = pathlib.Path(checkpoint_dir)
+    assets_source = None
+    for candidate in (ckpt / "assets", ckpt.parent / "assets"):
+        if candidate.exists():
+            assets_source = candidate
+            break
+    if assets_source is not None:
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
             shutil.rmtree(assets_dest)
         shutil.copytree(assets_source, assets_dest)
+        print(f"Copied assets from {assets_source} -> {assets_dest}")
+    else:
+        print("Warning: no assets/ folder found next to the checkpoint; copy norm stats manually.")
 
     # Save config as JSON for reference
     config_dict = {
