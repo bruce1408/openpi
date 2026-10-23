@@ -27,7 +27,7 @@ HoloQuant 是 conda `torch212`（PyTorch 2.12）。混装会把环境装坏。
 | 台阶 | 是什么 | 谁写 |
 |---|---|---|
 | L0 | 官方 bf16 `sample_actions` 的动作和中间张量 | 本脚本必做 |
-| L1 | ModelOpt 把 Prefix / Denoise 的 Linear 按 **FP8 E4M3** 假量化 | 本脚本必做（MTQ） |
+| L1 | ModelOpt 把 Prefix / Denoise 的 Linear 按 **FP8 E4M3** 假量化；Vision 的 Linear 按 `vision` amax 假量化（`--l1-vision fp8`，默认） | 本脚本必做（MTQ + Vision hook） |
 | L1-TRT | 同一批样本再跑 TensorRT `mtqfp8` engine | 加 `--trt` 才有 |
 | L2 | HoloQuant `02_run_npu_sim.py` 遍历静态图、调度自研 NPU 算子 | 不在本目录 |
 
@@ -39,15 +39,17 @@ HoloQuant 整网仿真要的就是这套 **FP8 尺子**。不要把「bf16 + MTQ
 
 ## 2. 三段各自量化没有
 
-一次 `infer` 可以想成三段。量化范围和 TensorRT 当前方案对齐，但 HoloQuant 建图时对 Vision 更激进一点：
+一次 `infer` 可以想成三段。Prefix / Denoise 和 TensorRT 当前方案对齐；Vision 官方不量化，但 HoloQuant 建图时量化了，所以 L1 也跟着量化，L1 / L2 才可比：
 
-| 段 | 官方 MTQ / `--trt` 对照 | HoloQuant 01 静态图 |
-|---|---|---|
-| **Vision**（SigLIP + 投影） | **不量化**，仍按 bf16 算。ModelOpt 关掉了 `vision_tower`、`multi_modal_projector` | Linear（QKV/O、MLP、投影）打成 **FP8 E4M3**；patch Conv、LayerNorm 仍是 FP32 |
-| **Prefix**（Gemma-2B） | Linear **FP8 E4M3**（`FP8_DEFAULT_CFG`，和 `mtqfp8` 同一配方） | 同样用 `fp8_amax.json` 的 `mtq` 段 |
-| **Denoise**（Gemma-300M expert） | Linear **FP8 E4M3**，同上 | 同上 |
+| 段 | 官方 MTQ / `--trt` 对照 | 本脚本 L1（`fq_actions`） | HoloQuant 01 静态图 |
+|---|---|---|---|
+| **Vision**（SigLIP + 投影） | **不量化**，仍按 bf16 算。ModelOpt 关掉了 `vision_tower`、`multi_modal_projector` | Linear 按 `vision` amax 假量化成 **FP8 E4M3**（`--l1-vision off` 则不量化） | Linear（QKV/O、MLP、投影）打成 **FP8 E4M3**；patch Conv、LayerNorm 仍是 FP32 |
+| **Prefix**（Gemma-2B） | Linear **FP8 E4M3**（`FP8_DEFAULT_CFG`，和 `mtqfp8` 同一配方） | MTQ 假量化 | 同样用 `fp8_amax.json` 的 `mtq` 段 |
+| **Denoise**（Gemma-300M expert） | Linear **FP8 E4M3**，同上 | 同上 | 同上 |
 
-Vision **不是 FP16**。官方不量化它，是因为 MTQ 配方故意关掉了；脚本仍用 forward hook 统计每个 Vision Linear 的 `max|x|`，写进 `fp8_amax.json` 的 `vision` 段，给 HoloQuant 的 01 打包用。
+Vision **不是 FP16**。官方不量化它，是因为 MTQ 配方故意关掉了；脚本用 forward hook 统计每个 Vision Linear 的 `max|x|`，写进 `fp8_amax.json` 的 `vision` 段。HoloQuant 01 用这份 amax 打包；L1 也用同一份 amax、同一套格子（`S = amax/448`，`x·(1/S)` 截断到 ±448 后转 E4M3）假量化 Vision 的输入和权重。
+
+所以 TRT 对照仍是「Vision bf16」，L1 默认是「Vision FP8」，两者 Vision 不同；比 L1 和 L2 时看 L1，比 MTQ 和 TRT 时加 `--l1-vision off`。
 
 注意力的 Q@K / attn@V、Softmax、RoPE、time MLP、`action_in_proj` / `action_out_proj`：**官方也不量化**。HoloQuant 里这些走 FP32 算子。
 
@@ -105,6 +107,7 @@ mkdir -p third_party/libero/libero/datasets
 | `--num-samples` | 10 | 只在 `--obs random` / `video` 时用 |
 | `--num-calib` | 16 | MTQ 校准条数（仍用假数据，避免量化格子被评测抽样带偏） |
 | `--seed` | 0 | 评测抽样可复现 |
+| `--l1-vision` | `fp8` | L1 是否假量化 Vision。`fp8`：和 HoloQuant 静态图一致；`off`：只有 MTQ（旧行为，和 TRT 一致） |
 | `--trt` | 关 | 同一批样本再跑 TensorRT `mtqfp8` |
 | `--out-dir` | 见下一节 | 产物目录；也可设 `HOLOQUANT_EXPORT_DIR` |
 | `--checkpoint-dir` | 自动查找 | 含 `model.safetensors` 的目录；也可设 `OPENPI_CHECKPOINT_DIR` |
@@ -134,15 +137,15 @@ mkdir -p third_party/libero/libero/datasets
 | `config.json` | 层数、头数、eps、RoPE、mask 值等，01 建图用 |
 | `constants.npz` | RoPE `inv_freq`、时间编码频率表 |
 | `fp8_amax.json` | `mtq`：Prefix/Denoise 每个 Linear 的 input/weight amax；`vision`：hook 统计 |
-| `samples/sample_XXX.npz` | 输入 + `ref_*`（L0 bf16）+ `fq_actions`（L1 MTQ）+ 可选 `trt_actions`；`libero` 时还有 `suite` / `task_id` / `episode` / `prompt` |
-| `summary.json` | L1 / TRT 相对 bf16 的动作 RMSE，以及 `sample_meta` |
+| `samples/sample_XXX.npz` | 输入 + `ref_*`（L0 bf16）+ `fq_actions`（L1：MTQ + 按 `l1_vision` 处理 Vision）+ 可选 `trt_actions`；`libero` 时还有 `suite` / `task_id` / `episode` / `prompt` |
+| `summary.json` | L1 / TRT 相对 bf16 的动作 RMSE、`l1_vision`、`checkpoint`（路径 + 大小 + 完整 SHA256），以及 `sample_meta` |
 
 成功标志：上面四个文件都在，且 `samples/` 里有 20 个 `sample_*.npz`（`--obs libero` 默认）。
 `summary.json` 认这几项：
 
 - `obs` 为 `libero`（或你显式选的 `random` / `video`），**不是** `synthetic_tensors`
 - `libero` 时 `sample_meta` 四个套件各 5 条，带真实任务语言
-- 有 `fq_rmse_mean`（MTQ 相对 bf16）
+- 有 `fq_rmse_mean`（L1 相对 bf16），`l1_vision` 为 `fp8`（要和 HoloQuant L2 比时）
 - 加了 `--trt` 时 `trt_rmse_mean` 有数，不是 `null`
 
 目录里如果已经是别的导出，先把旧目录改名挪走再跑，避免和官方尺子混在一起。
@@ -169,7 +172,9 @@ python holoq/samples/pi05_npu_sim/pi05_full/03_compare.py --backend mixed
 
 `02` 会按目录里有几个 `sample_*.npz` 跑几条（默认 20）。完整命令见 HoloQuant `Docs/npu仿真与π05整网.md` 第 11 节。
 
-`02 --backend ba2701` 是逐位 MMA，整网很慢，不要用来扫精度。
+`02 --backend ba2701` 乘加也走芯片 MMA 模型，一条样本约 50 分钟（20 条约 16 小时），不要用来扫精度。
+
+**重新导出后**，`fp8_amax.json` / `config.json` 可能变了：01、02 要重跑。03 会比对 01 记下的指纹，对不上就停下。
 
 ---
 
@@ -190,7 +195,8 @@ python holoq/samples/pi05_npu_sim/pi05_full/03_compare.py --backend mixed
 |---|---|
 | 仓库里没有 `.venv`，却用系统 / conda python 跑 `.py` | 找不到 `openpi`；先建好 OpenPI 环境 |
 | 把「bf16 + MTQ」理解成整网用 bf16 | 量化目标其实是 FP8 E4M3 |
-| 以为 Vision 是 FP16 | 官方不量化（bf16 算）；HoloQuant 图里 Linear 是 FP8 |
+| 以为 Vision 是 FP16 | 官方不量化（bf16 算）；HoloQuant 图里和 L1（默认）的 Linear 是 FP8 |
+| 用 `--l1-vision off` 的导出去比 HoloQuant L2 | L1 少量化了 Vision，L2 偏大一截是正常的，不是算子问题 |
 | 用合成输入 / 本地假量化当精度尺子 | 那不是默认的 `--obs libero`；NPU 精度分析用本脚本导出 |
 | 把 20 条开场观测当成四个任务的成功率 | 成功率请跑 `bf6_run_eval.sh` |
 | HoloQuant `01`/`02` 加 `--smoke` 当整网精度 | 图只有 1 层 / 只跑 1 步，不对比整网动作 |

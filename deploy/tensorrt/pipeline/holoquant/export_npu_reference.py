@@ -11,10 +11,14 @@
     constants.npz           RoPE 的 inv_freq、时间编码的频率表（编译期常量）
     fp8_amax.json           每个 FP8 Linear 的 input / weight amax
                               Prefix / Denoise：MTQ FP8_DEFAULT_CFG，与 TRT mtqfp8 同一配方
-                              Vision：forward hook 统计 max|x|（MTQ 配方里 vision 不量化）
+                              Vision：forward hook 统计 max|x|（MTQ 配方关掉了 vision）
     samples/sample_XXX.npz  一条样本：模型输入、bf16 PyTorch 的中间结果和动作，
-                            以及 MTQ 假量化动作（L1）、TensorRT 动作（--trt）
+                            以及假量化动作（L1）、TensorRT 动作（--trt）
     summary.json            L1 / TRT 相对 bf16 的动作 RMSE
+
+L1 = MTQ 假量化 Prefix / Denoise 的 Linear，再用 fp8_amax.json 的 vision 段假量化 Vision 的 Linear
+（``--l1-vision fp8``，默认）。HoloQuant 的 L2 用同一份 vision amax，这样 L1 / L2 量化的层一致。
+``--l1-vision off`` 退回旧口径（Vision 保持 bf16）。
 
 默认 ``--obs libero``：四个评测套件（spatial / object / goal / 10）各随机抽
 ``--per-suite`` 条真实初始观测（默认 5，共 20）。``--obs random`` 仍可用假数据；
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.util
 import json
 import math
@@ -497,6 +502,37 @@ def vision_amax(model, image_batches: list[torch.Tensor]) -> dict:
     }
 
 
+def fp8_fakequant(x: torch.Tensor, amax: float) -> torch.Tensor:
+    """E4M3 逐张量假量化，格子和 HoloQuant ``kernels/fp8.py`` 相同。
+
+    S = fp32(amax/448)，q = e4m3(x · fp32(1/S))（先饱和到 ±448），再乘回 S，最后转回 x 的 dtype。
+    """
+    s = torch.tensor(max(abs(float(amax)), 1e-12) / 448.0, dtype=torch.float32, device=x.device)
+    q = (x.float() * torch.reciprocal(s)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return (q.float() * s).to(x.dtype)
+
+
+@torch.no_grad()
+def install_vision_fp8(model, vision: dict) -> list:
+    """L1 也量化 Vision：每个 Linear 的权重原地假量化一次，输入用 forward pre-hook 假量化。
+
+    amax 就是 fp8_amax.json 的 vision 段，HoloQuant 建图时用的是同一份。会改模型权重，只能在 L1 前调用。
+    """
+    mods = dict(model.named_modules())
+    handles = []
+    for name, entry in vision.items():
+        mod = mods[name]
+        # MTQ 包过的 QuantLinear 上 .weight 可能是动态属性，直接改底层 Parameter
+        weight = mod._parameters['weight']  # noqa: SLF001
+        weight.copy_(fp8_fakequant(weight, entry['weight_amax']))
+
+        def hook(_m, args, amax=entry['input_amax']):
+            return (fp8_fakequant(args[0], amax), *args[1:])
+
+        handles.append(mod.register_forward_pre_hook(hook))
+    return handles
+
+
 def mtq_amax(model, calib: list, device: str, openpi_root: Path) -> dict:
     """与 run_step2 / run_step3 相同的 MTQ 配方，同时量化 Prefix 和 Denoise 的 Linear。
 
@@ -533,6 +569,27 @@ def _rmse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)))
 
 
+def _checkpoint_id(path: Path) -> dict:
+    """权重文件身份：路径/大小用于诊断，完整 SHA256 用于跨仓库判断同一模型。"""
+    real = Path(os.path.realpath(path))
+    exists = real.is_file()
+    return dict(
+        path=str(real),
+        size=real.stat().st_size if exists else None,
+        sha256=_file_sha256(real, truncate=None) if exists else None,
+    )
+
+
+def _file_sha256(path: Path, *, truncate: int | None = 16) -> str:
+    """流式计算文件原始字节 SHA256；配置默认 16 位，checkpoint 保留完整摘要。"""
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    return value if truncate is None else value[:truncate]
+
+
 def share_outputs(root: Path) -> None:
     """产物给 users 组和同事读写。临时目录 / umask 常把新目录收成 700。"""
     if not root.exists():
@@ -567,6 +624,8 @@ def main() -> None:
         '--obs', choices=('libero', 'random', 'video'), default='libero',
         help='libero：四个评测套件真实初始观测；random：假数据；video：Spatial 视频帧',
     )
+    ap.add_argument('--l1-vision', choices=('fp8', 'off'), default='fp8',
+                    help='fp8：L1 也按 vision amax 假量化 Vision Linear，和 HoloQuant L2 一致；off：Vision 保持 bf16')
     ap.add_argument('--trt', action='store_true', help='同一批样本再跑一遍 TensorRT mtqfp8，作为对照组')
     ap.add_argument('--out-dir', type=Path, default=None,
                     help='产物目录；也可设 HOLOQUANT_EXPORT_DIR')
@@ -705,17 +764,33 @@ def main() -> None:
     print('[export] mtq.quantize（Prefix + Denoise Linear，FP8 E4M3 逐张量）')
     amax['mtq'] = mtq_amax(model, calib, args.device, openpi_root)
     print(f'[export] MTQ amax：{len(amax["mtq"])} 个 Linear')
+    # MTQ 校准之后再装，Prefix / Denoise 的 amax 和旧口径保持一致
+    vision_hooks = install_vision_fp8(model, amax['vision']) if args.l1_vision == 'fp8' else []
+    print(f'[export] L1 Vision：{args.l1_vision}（假量化 {len(vision_hooks)} 个 Linear）')
     fq_actions = []
     for obs, noise in observations:
         with torch.no_grad():
             fq_actions.append(_f32(model.sample_actions(args.device, obs, noise=noise.clone())[0]))
+    for h in vision_hooks:
+        h.remove()
 
     amax['recipe'] = dict(
         format='fp8_e4m3', granularity='per-tensor', scale='amax/448',
         mtq='FP8_DEFAULT_CFG + run_step2._ALWAYS_DISABLE（Prefix 与 Denoise 的 Linear）',
         vision='forward hook max|x|，校准图像 = 16 条校准观测 + calib/pixel_values.npy',
     )
-    (out_dir / 'fp8_amax.json').write_text(json.dumps(amax, indent=2) + '\n')
+    amax_path = out_dir / 'fp8_amax.json'
+    amax_path.write_text(json.dumps(amax, indent=2) + '\n')
+    vision_contract = dict(
+        enabled=args.l1_vision == 'fp8',
+        format='fp8_e4m3',
+        granularity='per-tensor',
+        scale='amax/448',
+        modules=sorted(amax['vision']),
+        module_count=len(amax['vision']),
+        applied_module_count=len(vision_hooks),
+        fp8_amax_sha256=_file_sha256(amax_path),
+    )
 
     # ---- 6) 写样本 ----
     rows = []
@@ -736,6 +811,9 @@ def main() -> None:
         obs=args.obs,
         per_suite=args.per_suite if args.obs == 'libero' else None,
         suites=args.suites if args.obs == 'libero' else None,
+        l1_vision=args.l1_vision,
+        l1_vision_contract=vision_contract,
+        checkpoint=_checkpoint_id(checkpoint_dir / 'model.safetensors'),
         fq_rmse_mean=float(np.mean([r['fq_rmse'] for r in rows])),
         trt_rmse_mean=float(np.mean([r['trt_rmse'] for r in rows])) if trt_actions is not None else None,
         sample_meta=[{k: cap[k] for k in ('suite', 'task_id', 'episode', 'prompt') if k in cap}
@@ -743,7 +821,7 @@ def main() -> None:
         rows=rows, seconds=round(time.time() - t0, 1),
     )
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-    print(f'[export] L1 MTQ 假量化 RMSE={summary["fq_rmse_mean"]:.6f}'
+    print(f'[export] L1 假量化（Vision={args.l1_vision}）RMSE={summary["fq_rmse_mean"]:.6f}'
           + (f'  TensorRT RMSE={summary["trt_rmse_mean"]:.6f}' if trt_actions is not None else ''))
     share_outputs(out_dir)
     print(f'[export] 完成 {summary["seconds"]}s -> {out_dir}')
