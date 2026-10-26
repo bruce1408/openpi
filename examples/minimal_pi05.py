@@ -660,7 +660,7 @@ class TinyPi05(nn.Module):
         # [B] -> [B, 1, 1]，从而在 H 和 action_dim 两个维度广播。
         expanded_time = time[:, None, None]
         
-        # t=1 时 x_t=noise；t=0 时 x_t=actions。
+        # t=1 时 x_t=noise；t=0 时 x_t=actions。[2, 10, 32]
         x_t = expanded_time * noise + (1.0 - expanded_time) * actions
         
         # 因为采用直线路径，针对一对 (noise, action)，目标速度不随 t 改变。
@@ -668,7 +668,7 @@ class TinyPi05(nn.Module):
 
         # 训练时 Prefix 和 Expert 联合训练，所以这里不 detach cache。
         cache = self.encode_prefix(images, image_valid, token_ids, token_valid)
-        predicted_velocity = self.predict_velocity(x_t, time, cache)
+        predicted_velocity = self.predict_velocity(x_t, time, cache)  # time [2]
         loss = F.mse_loss(predicted_velocity, target_velocity)
         
         # 附带返回中间量，方便调试和理解；detach 避免外部日志意外保留计算图。
