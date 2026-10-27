@@ -5,7 +5,7 @@
 不 import holoq。产物全部是 json / npz，HoloQuant 的 02 / 03 只读文件。
 权重不在这里导出，HoloQuant 的 02 直接读 checkpoint 的 model.safetensors。
 
-产物（默认 ``<workspace>/Outputs/HoloQuant/pi05_libero/openpi_export/``）::
+产物（默认 ``<workspace>/Outputs/HoloQuant/pi05_libero/openpi_export_40/``）::
 
     config.json             模型超参：层数、头数、eps、RoPE base、mask 值……
     constants.npz           RoPE 的 inv_freq、时间编码的频率表（编译期常量）
@@ -20,8 +20,8 @@ L1 = MTQ 假量化 Prefix / Denoise 的 Linear，再用 fp8_amax.json 的 vision
 （``--l1-vision fp8``，默认）。HoloQuant 的 L2 用同一份 vision amax，这样 L1 / L2 量化的层一致。
 ``--l1-vision off`` 退回旧口径（Vision 保持 bf16）。
 
-默认 ``--obs libero``：四个评测套件（spatial / object / goal / 10）各随机抽
-``--per-suite`` 条真实初始观测（默认 5，共 20）。``--obs random`` 仍可用假数据；
+默认 ``--obs libero``：遍历四个评测套件（spatial / object / goal / 10）的 40 个真实 task，
+每个 task 随机抽 ``--per-task`` 个初始状态（默认 1，共 40 条）。``--obs random`` 仍可用假数据；
 ``--obs video`` 仍可用 Spatial 视频帧。
 
 在 OpenPI 仓库根执行::
@@ -31,7 +31,6 @@ L1 = MTQ 假量化 Prefix / Denoise 的 Linear，再用 fp8_amax.json 的 vision
     ./deploy/tensorrt/pipeline/holoquant/export_npu_reference.sh --trt
 """
 
-from __future__ import annotations
 
 import argparse
 import copy
@@ -126,6 +125,7 @@ except ImportError as exc:  # 错环境时给明确提示，不把 import 藏在
     _OPENPI_IMPORT_ERROR = exc
 
 LIBERO_SUITES = ('libero_spatial', 'libero_object', 'libero_goal', 'libero_10')
+LIBERO_TASKS_PER_SUITE = 10
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 LIBERO_NUM_STEPS_WAIT = 10
@@ -162,20 +162,24 @@ def find_openpi_root(explicit: Path | None = None) -> Path:
     )
 
 
-def default_out_dir(openpi_root: Path) -> Path:
+def default_out_dir(openpi_root: Path, sample_count: int | None = None) -> Path:
     """两边仓库约定的交换目录，不 import HoloQuant。
 
     顺序：``HOLOQUANT_EXPORT_DIR`` → 沿仓库往上找已存在的 ``Outputs/HoloQuant``
     → 仓库内 ``outputs/holoquant_export``。
+
+    LIBERO 默认路径会追加总样本数（如 ``openpi_export_40``），
+    避免覆盖旧导出。显式的 ``HOLOQUANT_EXPORT_DIR`` 则严格按用户给定的路径使用。
     """
     env = os.environ.get('HOLOQUANT_EXPORT_DIR')
     if env:
         return Path(env).expanduser().resolve()
+    suffix = f'_{sample_count}' if sample_count is not None else ''
     for ancestor in [openpi_root, *openpi_root.parents]:
         holo_root = ancestor / 'Outputs' / 'HoloQuant'
         if holo_root.is_dir():
-            return holo_root / 'pi05_libero' / 'openpi_export'
-    return (openpi_root / 'outputs' / 'holoquant_export').resolve()
+            return holo_root / 'pi05_libero' / f'openpi_export{suffix}'
+    return (openpi_root / 'outputs' / f'holoquant_export{suffix}').resolve()
 
 
 def resolve_checkpoint_dir(explicit: str | Path | None, openpi_root: Path) -> Path:
@@ -362,11 +366,15 @@ def _get_libero_env(task, resolution: int, seed: int):
 
 def sample_libero_eval_examples(
     suites: list[str],
-    per_suite: int,
+    per_task: int,
     seed: int,
     openpi_root: Path,
 ) -> list[dict]:
-    """从官方 LIBERO 评测套件各抽 per_suite 条：随机任务 + 随机初始状态，等物体落下后再拍照。"""
+    """遍历官方 LIBERO 评测套件的每个 task，每任务抽 per_task 个初始状态。
+
+    抽样在每个 task 内不放回进行，因此 ``per_task=1`` 会精确覆盖每个 task 一次，
+    不会像在整个 suite 的组合池中混合抽样那样重复或遗漏 task。
+    """
     libero_root = openpi_root / 'third_party' / 'libero'
     if libero_root.is_dir() and str(libero_root) not in sys.path:
         sys.path.insert(0, str(libero_root))
@@ -385,37 +393,44 @@ def sample_libero_eval_examples(
         if suite_name not in benchmark.get_benchmark_dict():
             raise SystemExit(f'未知 LIBERO 套件 {suite_name!r}，可选：{LIBERO_SUITES}')
         task_suite = benchmark.get_benchmark_dict()[suite_name]()
-        pairs: list[tuple[int, int]] = []
-        for task_id in range(task_suite.n_tasks):
-            n_init = len(task_suite.get_task_init_states(task_id))
-            pairs.extend((task_id, ep) for ep in range(n_init))
-        if len(pairs) < per_suite:
+        if task_suite.n_tasks != LIBERO_TASKS_PER_SUITE:
             raise SystemExit(
-                f'{suite_name} 只有 {len(pairs)} 条初始状态，不够抽 {per_suite} 条')
-        pick = rng.choice(len(pairs), size=per_suite, replace=False)
-        print(f'[export] {suite_name}：从 {len(pairs)} 条评测初始状态抽 {per_suite} 条', flush=True)
-        for idx in pick:
-            task_id, episode = pairs[int(idx)]
+                f'{suite_name} 实际有 {task_suite.n_tasks} 个 task，'
+                f'但当前导出配置预期 {LIBERO_TASKS_PER_SUITE} 个')
+        print(
+            f'[export] {suite_name}：{task_suite.n_tasks} 个 task，'
+            f'每个 task 随机抽 {per_task} 个初始状态',
+            flush=True,
+        )
+        for task_id in range(task_suite.n_tasks):
+            init_states = task_suite.get_task_init_states(task_id)
+            if len(init_states) < per_task:
+                raise SystemExit(
+                    f'{suite_name} task={task_id} 只有 {len(init_states)} 条初始状态，'
+                    f'不够抽 {per_task} 条')
+            episodes = rng.choice(len(init_states), size=per_task, replace=False)
             task = task_suite.get_task(task_id)
-            env, prompt = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
-            try:
-                env.reset()
-                obs = env.set_init_state(task_suite.get_task_init_states(task_id)[episode])
-                for _ in range(LIBERO_NUM_STEPS_WAIT):
-                    obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
-                example = _env_obs_to_example(obs, prompt)
-            finally:
+            for episode_raw in episodes:
+                episode = int(episode_raw)
+                env, prompt = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
                 try:
-                    env.close()
-                except Exception:
-                    pass
-            example['_meta'] = dict(
-                suite=suite_name, task_id=int(task_id), episode=int(episode), prompt=str(prompt))
-            examples.append(example)
-            print(
-                f'  [export] {suite_name} task={task_id} ep={episode}  {prompt}',
-                flush=True,
-            )
+                    env.reset()
+                    obs = env.set_init_state(init_states[episode])
+                    for _ in range(LIBERO_NUM_STEPS_WAIT):
+                        obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
+                    example = _env_obs_to_example(obs, prompt)
+                finally:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+                example['_meta'] = dict(
+                    suite=suite_name, task_id=int(task_id), episode=episode, prompt=str(prompt))
+                examples.append(example)
+                print(
+                    f'  [export] {suite_name} task={task_id} ep={episode}  {prompt}',
+                    flush=True,
+                )
     return examples
 
 
@@ -613,9 +628,9 @@ def main() -> None:
     ap.add_argument('--config-name', default=None)
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--num-samples', type=int, default=10,
-                    help='--obs random/video 时的条数；--obs libero 时忽略，改用套件数 × --per-suite')
-    ap.add_argument('--per-suite', type=int, default=5,
-                    help='--obs libero 时每个评测套件随机抽几条（默认 4×5=20）')
+                    help='--obs random/video 时的条数；--obs libero 时忽略，改用 task 数 × --per-task')
+    ap.add_argument('--per-task', type=int, default=1,
+                    help='--obs libero 时每个实际 task 随机抽几个初始状态（默认 4×10×1=40）')
     ap.add_argument('--suites', default=','.join(LIBERO_SUITES),
                     help='--obs libero 时的套件列表，逗号分隔')
     ap.add_argument('--num-calib', type=int, default=16, help='MTQ 校准样本数（与 run_step2/3 相同）')
@@ -628,7 +643,7 @@ def main() -> None:
                     help='fp8：L1 也按 vision amax 假量化 Vision Linear，和 HoloQuant L2 一致；off：Vision 保持 bf16')
     ap.add_argument('--trt', action='store_true', help='同一批样本再跑一遍 TensorRT mtqfp8，作为对照组')
     ap.add_argument('--out-dir', type=Path, default=None,
-                    help='产物目录；也可设 HOLOQUANT_EXPORT_DIR')
+                    help='产物目录；也可设 HOLOQUANT_EXPORT_DIR。显式路径不会自动加样本数后缀')
     ap.add_argument('--openpi-root', type=Path, default=None,
                     help='一般不用。脚本已在本仓库里，省略时沿文件往上找仓库根')
     args = ap.parse_args()
@@ -650,10 +665,38 @@ def main() -> None:
         sys.path.insert(0, str(openpi_root))
     inductor_cache_env()
 
+    if args.obs == 'libero':
+        if args.per_task <= 0:
+            ap.error('--per-task 必须是正整数')
+        suites = [s.strip() for s in args.suites.split(',') if s.strip()]
+        if not suites:
+            ap.error('--obs libero 时 --suites 不能为空')
+        unknown_suites = [s for s in suites if s not in LIBERO_SUITES]
+        if unknown_suites:
+            ap.error(f'--suites 包含未支持的套件：{unknown_suites}；可选 {LIBERO_SUITES}')
+        if len(set(suites)) != len(suites):
+            ap.error('--suites 不能包含重复套件')
+        expected_samples = len(suites) * LIBERO_TASKS_PER_SUITE * args.per_task
+    else:
+        if args.num_samples <= 0:
+            ap.error('--num-samples 必须是正整数')
+        suites = []
+        expected_samples = args.num_samples
+    out_dir = (
+        Path(args.out_dir).expanduser().resolve()
+        if args.out_dir is not None
+        else default_out_dir(openpi_root, expected_samples if args.obs == 'libero' else None)
+    )
     checkpoint_dir = resolve_checkpoint_dir(args.checkpoint_dir, openpi_root)
     config_name = args.config_name or DEFAULT_CONFIG
-    out_dir = Path(args.out_dir) if args.out_dir is not None else default_out_dir(openpi_root)
     print(f'[export] checkpoint: {checkpoint_dir}', flush=True)
+    if args.obs == 'libero':
+        print(
+            f'[export] 样本计划：{len(suites)} 个套件 × '
+            f'{LIBERO_TASKS_PER_SUITE} 个 task/套件 × {args.per_task} 条/task'
+            f' = {expected_samples} 条',
+            flush=True,
+        )
     print(f'[export] out_dir: {out_dir}', flush=True)
     if args.trt and _tensorrt_lib_dir() is None:
         print('[export] 未找到 TensorRT lib（请 export TRT_ROOT=... 或把 trtexec 加入 PATH）', flush=True)
@@ -677,10 +720,16 @@ def main() -> None:
     np.random.seed(args.seed)
     noise_rng = np.random.default_rng(args.seed)
     if args.obs == 'libero':
-        suites = [s.strip() for s in args.suites.split(',') if s.strip()]
         raw_examples = sample_libero_eval_examples(
-            suites, args.per_suite, args.seed, openpi_root)
-        print(f'[export] libero 真实评测观测：{len(suites)} 套件 × {args.per_suite} = {len(raw_examples)} 条')
+            suites, args.per_task, args.seed, openpi_root)
+        print(
+            f'[export] libero 真实评测观测：{len(suites)} 套件 × '
+            f'{LIBERO_TASKS_PER_SUITE} task/套件 × {args.per_task} 条/task'
+            f' = {len(raw_examples)} 条')
+        if len(raw_examples) != expected_samples:
+            raise RuntimeError(
+                f'LIBERO 分层抽样数量异常：计划 {expected_samples} 条，'
+                f'实际 {len(raw_examples)} 条')
     elif args.obs == 'video':
         raw_examples = [make_random_example(frames(i) if frames else None) for i in range(args.num_samples)]
         for i, ex in enumerate(raw_examples):
@@ -806,10 +855,13 @@ def main() -> None:
 
     summary = dict(
         num_samples=len(samples),
+        expected_num_samples=expected_samples,
         num_calib=args.num_calib,
         seed=args.seed,
         obs=args.obs,
-        per_suite=args.per_suite if args.obs == 'libero' else None,
+        sampling='stratified_per_task' if args.obs == 'libero' else None,
+        per_task=args.per_task if args.obs == 'libero' else None,
+        tasks_per_suite=LIBERO_TASKS_PER_SUITE if args.obs == 'libero' else None,
         suites=args.suites if args.obs == 'libero' else None,
         l1_vision=args.l1_vision,
         l1_vision_contract=vision_contract,
