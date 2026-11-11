@@ -168,6 +168,13 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# link_shared_artifacts.sh 生成的本机软链接，不要提交绝对路径
+/deploy/tensorrt/artifacts/onnx
+/deploy/tensorrt/artifacts/engines
+/deploy/tensorrt/artifacts/calib
+/deploy/tensorrt/artifacts/engines_legacy_attn_fp8
+/deploy/tensorrt/artifacts/logs
+
 *.npy
 *.plan
 *.engine

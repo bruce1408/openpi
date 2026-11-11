@@ -156,7 +156,11 @@ mkdir -p third_party/libero/libero/datasets
 
 不要为了消警告去下载整套 LIBERO 演示数据。
 
-`--trt` 会设 `OPENPI_TRT_PRECISION=mtqfp8`，跑已经编好的 **FP8** engine。本机还没有 `deploy/tensorrt/artifacts/` 下的 plan 时，不要加 `--trt`，或先走 `../fp8/` 把 engine 编出来。
+`--trt` 会设 `OPENPI_TRT_PRECISION=mtqfp8`，跑已经编好的 **FP8** engine。本机还没有 `deploy/tensorrt/artifacts/` 下的 plan 时，先链接公用产物，或走 `../fp8/` 自己编：
+
+```bash
+bash deploy/tensorrt/link_shared_artifacts.sh
+```
 
 默认 LIBERO 产物现在写到 `openpi_export_40/`，不会覆盖旧的 `openpi_export/samples/`。起 40 次仿真器会比假数据慢。
 

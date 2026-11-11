@@ -83,6 +83,23 @@ We also provide "expert" checkpoints for various robot platforms and tasks. Thes
 
 By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
 
+### 本机共享权重与 TensorRT 产物
+
+这台 GPU 服务器上，π₀.₅-LIBERO 的权重和已经编好的 TensorRT 产物放在公用盘，**不要从别人的 `workspace` 整仓库拷贝**。
+
+| 内容 | 路径 |
+| --- | --- |
+| PyTorch 权重 | `/share_data/public/models/openpi/pi05_libero_pytorch` |
+| TensorRT ONNX / engine / 校准（约 51GB） | `/share_data/public/models/openpi/pi05_libero_tensorrt` |
+
+clone 本仓库（例如 `cdd_dev`）并 `uv sync` 之后，把 TensorRT 产物软链接进当前仓库：
+
+```bash
+bash deploy/tensorrt/link_shared_artifacts.sh
+```
+
+脚本会把 `deploy/tensorrt/artifacts/` 下的 `onnx`、`engines`、`calib` 等链到公用目录。推理脚本仍读仓库里的 `artifacts/`，不用改代码。公用目录请只读；若要重编 engine，写到自己的目录。
+
 
 
 

@@ -22,6 +22,20 @@
 /share_data/public/models/openpi/pi05_libero_pytorch/model.safetensors
 ```
 
+TensorRT 的 ONNX / engine / 校准在公用盘（约 51GB），不要复制进自己的仓库。clone 之后执行：
+
+```bash
+bash deploy/tensorrt/link_shared_artifacts.sh
+```
+
+会把 `deploy/tensorrt/artifacts/{onnx,engines,calib,...}` 软链接到：
+
+```text
+/share_data/public/models/openpi/pi05_libero_tensorrt
+```
+
+链接成功后，下面路径和以前一样用即可。请只读公用目录；重编 engine 写到自己的目录。
+
 ---
 
 ## 1. 这套 FP8 在做什么（先建立直觉）
