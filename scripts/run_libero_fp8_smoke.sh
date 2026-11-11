@@ -2,7 +2,7 @@
 # FP8 冒烟：1 个 LIBERO spatial 任务 × 2 条 episode，单卡。
 set -euo pipefail
 
-cd /share_data/bruce/workspace/ai/openpi
+cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 TRT_ROOT="${TRT_ROOT:-/share_data/bruce/software/TensorRT-11.2.1.2}"
 export LD_LIBRARY_PATH="${TRT_ROOT}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

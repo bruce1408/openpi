@@ -1,7 +1,7 @@
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
-∏
+
 Currently, this repo contains three types of models:
 - the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
 - the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
@@ -42,6 +42,8 @@ git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
 git submodule update --init --recursive
 ```
 
+官方上游是 [Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi)，仅在需要对齐上游官方代码时使用。同事在本 GPU 服务器上的完整步骤见下面 **「在本 GPU 服务器上使用」**。
+
 We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
 
 ```bash
@@ -53,8 +55,7 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
-
-
+在本实验室 GPU 服务器上给同事复用时，请看下面 **「在本 GPU 服务器上使用」**，不要拷别人的整个 `workspace`。
 
 ## Model Checkpoints
 
@@ -83,25 +84,114 @@ We also provide "expert" checkpoints for various robot platforms and tasks. Thes
 
 By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
 
-### 本机共享权重与 TensorRT 产物
+## 在本 GPU 服务器上使用
 
-这台 GPU 服务器上，π₀.₅-LIBERO 的权重和已经编好的 TensorRT 产物放在公用盘，**不要从别人的 `workspace` 整仓库拷贝**。
+给同事复用时：**只 clone 代码，权重和 TensorRT 产物用公用盘软链接。**  
+不要 `cp` 别人的 `/share_data/<user>/workspace/ai/openpi`（里面有 `.venv` 和本机路径）。
 
-| 内容 | 路径 |
-| --- | --- |
-| PyTorch 权重 | `/share_data/public/models/openpi/pi05_libero_pytorch` |
-| TensorRT ONNX / engine / 校准（约 51GB） | `/share_data/public/models/openpi/pi05_libero_tensorrt` |
+本仓库远程：`git@github.com:bruce1408/openpi.git`，日常分支：`cdd_dev`。
 
-clone 本仓库（例如 `cdd_dev`）并 `uv sync` 之后，把 TensorRT 产物软链接进当前仓库：
+### 1. Clone 到自己的目录
+
+```bash
+cd /share_data/<你的用户名>          # 或你有写权限的目录，不要进别人的 workspace
+git clone --recurse-submodules -b cdd_dev git@github.com:bruce1408/openpi.git
+cd openpi
+```
+
+若已经 clone 过：
+
+```bash
+git fetch origin
+git checkout cdd_dev
+git pull
+git submodule update --init --recursive
+```
+
+### 2. 安装 Python 环境
+
+需要本机已安装 [uv](https://docs.astral.sh/uv/)。在仓库根目录：
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+```
+
+会在当前仓库下生成自己的 `.venv`（大约 6–9GB），不要复用别人的虚拟环境。
+
+跑 PyTorch / TensorRT 推理前，把模型补丁拷进当前环境的 transformers（每人的 `.venv` 都要做一次）：
+
+```bash
+cp -r ./src/openpi/models_pytorch/transformers_replace/* \
+  .venv/lib/python3.11/site-packages/transformers/
+```
+
+### 3. 接上公用权重和 TensorRT 产物
+
+| 内容 | 公用路径 | 不要做什么 |
+| --- | --- | --- |
+| π₀.₅-LIBERO PyTorch 权重 | `/share_data/public/models/openpi/pi05_libero_pytorch` | 不要再复制一份 |
+| TensorRT ONNX / engine / 校准（约 51GB） | `/share_data/public/models/openpi/pi05_libero_tensorrt` | 不要 `cp -a`，用软链接 |
+
+在仓库根目录执行：
 
 ```bash
 bash deploy/tensorrt/link_shared_artifacts.sh
 ```
 
-脚本会把 `deploy/tensorrt/artifacts/` 下的 `onnx`、`engines`、`calib` 等链到公用目录。推理脚本仍读仓库里的 `artifacts/`，不用改代码。公用目录请只读；若要重编 engine，写到自己的目录。
+它会把 `deploy/tensorrt/artifacts/` 下的 `onnx`、`engines`、`calib` 等链到公用目录。推理脚本仍然读仓库里的 `artifacts/`，**不用改代码**。再跑一遍脚本是安全的（已链接会提示「已是软链接」）。
 
+确认：
 
+```bash
+ls -l deploy/tensorrt/artifacts/engines
+test -f deploy/tensorrt/artifacts/engines/vision_mtqfp8.plan && echo engines_ok
+test -f /share_data/public/models/openpi/pi05_libero_pytorch/model.safetensors && echo weights_ok
+```
 
+`engines` 应显示箭头指向 `/share_data/public/models/openpi/pi05_libero_tensorrt/engines`。  
+公用目录请只读；若要重编 engine，写到自己的目录，不要覆盖公用份。
+
+其它官方 checkpoint（DROID / ALOHA 等）仍按上一节从 `gs://openpi-assets` 下载，缓存在 `~/.cache/openpi`。
+
+### 4. 怎么跑
+
+先看 `nvidia-smi`，不要占用别人正在用的 GPU，也不要杀别人的进程。
+
+**PyTorch 推理（π₀.₅-LIBERO）**，权重用公用盘：
+
+```bash
+export OPENPI_CHECKPOINT_DIR=/share_data/public/models/openpi/pi05_libero_pytorch
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_libero \
+  --policy.dir="${OPENPI_CHECKPOINT_DIR}"
+```
+
+或在 Python 里：
+
+```python
+from openpi.training import config as _config
+from openpi.policies import policy_config
+
+config = _config.get_config("pi05_libero")
+checkpoint_dir = "/share_data/public/models/openpi/pi05_libero_pytorch"
+policy = policy_config.create_trained_policy(config, checkpoint_dir)
+```
+
+**TensorRT FP8 评测 / 冒烟**：先完成第 3 步链接，再看详细步骤 [LIBERO_FP8_EVAL.md](LIBERO_FP8_EVAL.md)。单卡冒烟示例：
+
+```bash
+# 确认 GPU 空闲后再设 CUDA_VISIBLE_DEVICES
+bash scripts/run_libero_fp8_smoke.sh
+```
+
+HoloQuant 导出对照见 [deploy/tensorrt/pipeline/holoquant/README.md](deploy/tensorrt/pipeline/holoquant/README.md)。LIBERO 仿真评测见 [examples/libero/README.md](examples/libero/README.md)。
+
+### 5. 不要做的事
+
+- 不要把 `.venv`、`data/`、`deploy/tensorrt/artifacts` 里的大文件推进 Git。
+- 不要两个人在同一个工作区里同时改代码。
+- 不要把 51GB TensorRT 产物拷进自己的仓库。
 
 ## Running Inference for a Pre-Trained Model
 
